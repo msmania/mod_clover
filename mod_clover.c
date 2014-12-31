@@ -11,7 +11,6 @@
 #include "ap_config.h"
 #include "apr_strings.h"
 
-#define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define LODWORD(ll) (((long long)(ll))&0xffffffff)
 #define HIDWORD(ll) ((((long long)(ll))>>32)&0xffffffff)
 #define LLP(p) HIDWORD(p), LODWORD(p)
@@ -57,8 +56,7 @@ static const char HTML_DOCTYPES[][150] = {
     "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">\n",
     "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">\n",
     "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Frameset//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd\">\n",
-    "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.1//EN\" \"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd\">\n",
-    ""
+    "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.1//EN\" \"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd\">\n"
 };
 
 static void *create_config(apr_pool_t *pool, char *x);
@@ -80,6 +78,7 @@ typedef struct {
 } filter_context;
 
 typedef struct {
+    int dynamic;
     const char *doctype;
     const char *docmode;
 } module_config;
@@ -91,6 +90,9 @@ static const command_rec commands_table[] = {
     AP_INIT_TAKE1("Clover_DocMode", ap_set_string_slot,
                   (void*)APR_OFFSETOF(module_config, docmode), OR_ALL,
                   "Document mode for IE"),
+    AP_INIT_TAKE1("Clover_Dynamic", ap_set_int_slot,
+                  (void*)APR_OFFSETOF(module_config, dynamic), OR_ALL,
+                  "Control via a query string if the value is non-zernon-zero"),
     {NULL}
 };
 
@@ -127,6 +129,7 @@ static void *merge_config(apr_pool_t *pool, void *in_base, void *in_add) {
     module_config *newconfig = apr_palloc(pool, sizeof(module_config));
     newconfig->doctype = add->doctype ? add->doctype : base->doctype;
     newconfig->docmode = add->docmode ? add->docmode : base->docmode;
+    newconfig->dynamic = add->dynamic;
 
     return newconfig;
 }
@@ -134,8 +137,11 @@ static void *merge_config(apr_pool_t *pool, void *in_base, void *in_add) {
 static void *init_context(ap_filter_t *f) {
     if ( !f->ctx ) {
         filter_context *context = f->ctx = apr_palloc(f->r->pool, sizeof(filter_context));
-
         module_config *config = ap_get_module_config(f->r->per_dir_config, &clover_module);
+        module_config effective;
+
+        memset(context, 0, sizeof(context));
+        memset(&effective, 0, sizeof(effective));
 
         apr_pool_create(&context->subpool, f->r->pool);
 
@@ -156,10 +162,45 @@ static void *init_context(ap_filter_t *f) {
             logging(context, f->r, "ap_regcomp for docmode failed.");
         }
 
-        context->doctype = config->doctype ? HTML_DOCTYPES[MIN(atoi(config->doctype), doctype_Sentinel)] : "";
-        context->docmode = config->docmode ? apr_psprintf(f->r->pool, HTML_DOCMODE_TEMPLATE, config->docmode) : "";
+        if ( config->dynamic ) {
+            const char delim[] = "&";
+            char *querystring = apr_psprintf(context->subpool, "%s", f->r->parsed_uri.query);
+            char *pair = NULL;
+            char *last = NULL;
+            for ( pair = apr_strtok(querystring, delim, &last);
+                  pair;
+                  pair = apr_strtok(NULL, delim, &last) ) {
+                if ( (pair[0]=='t' || pair[0]=='T') && pair[1]=='=' ) {
+                    pair += 2;
+                    effective.doctype = pair;
+                }
+                else if ( (pair[0]=='m' || pair[0]=='M') && pair[1]=='=' ) {
+                    pair += 2;
+                    effective.docmode = pair;
+                }
+            }
+        }
+        else {
+            effective.doctype = config->doctype;
+            effective.docmode = config->docmode;
+        }
+
+        if ( effective.doctype ) {
+            int doctype_num = atoi(effective.doctype);
+            context->doctype = doctype_num < doctype_Sentinel ? HTML_DOCTYPES[doctype_num] : "";
+        }
+        else {
+            context->doctype = NULL;
+        }
+
+        context->docmode = effective.docmode ? apr_psprintf(f->r->pool, HTML_DOCMODE_TEMPLATE, effective.docmode) : NULL;
         context->processed_doctype = 0;
         context->processed_docmode = 0;
+
+        LOGDEBUG(context, f->r, "effective.doctype = %s", effective.doctype);
+        LOGDEBUG(context, f->r, "effective.docmode = %s", effective.docmode);
+        LOGDEBUG(context, f->r, "context->doctype = %s", context->doctype);
+        LOGDEBUG(context, f->r, "context->docmode = %s", context->docmode);
     }
 
     return f->ctx;
@@ -253,7 +294,7 @@ static apr_status_t clover_handler(ap_filter_t *f, apr_bucket_brigade *bb) {
 
                         if ( !context->processed_doctype && match_line(context->regex_doctype, linestr) ) {
                             replaced_line = context->doctype;
-                            linelength = strlen(replaced_line);
+                            linelength = replaced_line ? strlen(replaced_line) : linelength;
                         }
 
                         // If the first line is not DOCTYPE, we don't need to check DOCTYPE anymore.
@@ -261,7 +302,7 @@ static apr_status_t clover_handler(ap_filter_t *f, apr_bucket_brigade *bb) {
 
                         if ( !context->processed_docmode && match_line(context->regex_docmode, linestr) ) {
                             replaced_line = context->docmode;
-                            linelength = strlen(replaced_line);
+                            linelength = replaced_line ? strlen(replaced_line) : linelength;
                             context->processed_docmode = 1;
                         }
 
