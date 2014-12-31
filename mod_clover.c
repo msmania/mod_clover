@@ -11,11 +11,55 @@
 #include "ap_config.h"
 #include "apr_strings.h"
 
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define LODWORD(ll) (((long long)(ll))&0xffffffff)
 #define HIDWORD(ll) ((((long long)(ll))>>32)&0xffffffff)
 #define LLP(p) HIDWORD(p), LODWORD(p)
 
+#define LOGDEBUG
+
 static const char FILTER_NAME[]="CLOVER";
+
+/*
+   DocType
+
+   0 - No DOCTYPE
+   1 - HTML 5
+   2 - HTML 4.01 Strict
+   3 - HTML 4.01 Transitional
+   4 - HTML 4.01 Frameset
+   5 - XHTML 1.0 Strict
+   6 - XHTML 1.0 Transitional
+   7 - XHTML 1.0 Frameset
+   8 - XHTML 1.1
+ */
+
+enum HTML_DOCTYPE {
+    doctype_NA = 0,
+    doctype_HTML5,
+    doctype_HTML401Strict,
+    doctype_HTML401Transitional,
+    doctype_HTML401Frameset,
+    doctype_XHTML10Strict,
+    doctype_XHTML10Transitional,
+    doctype_XHTML10Frameset,
+    doctype_XHTML11,
+    doctype_Sentinel
+};
+
+static const char HTML_DOCMODE_TEMPLATE[] = "<meta http-equiv=\"x-ua-compatible\" content=\"IE=%s\">\n";
+static const char HTML_DOCTYPES[][150] = {
+    "",
+    "<!DOCTYPE html>\n",
+    "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\">\n",
+    "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">\n",
+    "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Frameset//EN\" \"http://www.w3.org/TR/html4/frameset.dtd\">\n",
+    "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">\n",
+    "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">\n",
+    "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Frameset//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd\">\n",
+    "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.1//EN\" \"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd\">\n",
+    ""
+};
 
 static void *create_config(apr_pool_t *pool, char *x);
 static void *merge_config(apr_pool_t *pool, void *in_base, void *in_add);
@@ -23,15 +67,30 @@ static void clover_register_hooks(apr_pool_t *p);
 
 typedef struct {
     apr_bucket_brigade *passbb;
+    apr_bucket_brigade *snippets;
     apr_pool_t *subpool;
+
+    ap_regex_t *regex_doctype;
+    ap_regex_t *regex_docmode;
+
+    const char *doctype;
+    const char *docmode;
+    int processed_doctype;
+    int processed_docmode;
 } filter_context;
 
 typedef struct {
-    int param1;
+    const char *doctype;
+    const char *docmode;
 } module_config;
 
 static const command_rec commands_table[] = {
-    AP_INIT_TAKE1("Param1", ap_set_int_slot, (void*)APR_OFFSETOF(module_config, param1), OR_ALL, "Parameter #1"),
+    AP_INIT_TAKE1("Clover_DocType", ap_set_string_slot,
+                  (void*)APR_OFFSETOF(module_config, doctype), OR_ALL,
+                  "HTML <!DOCTYPE> Declaration"),
+    AP_INIT_TAKE1("Clover_DocMode", ap_set_string_slot,
+                  (void*)APR_OFFSETOF(module_config, docmode), OR_ALL,
+                  "Document mode for IE"),
     {NULL}
 };
 
@@ -66,6 +125,8 @@ static void *merge_config(apr_pool_t *pool, void *in_base, void *in_add) {
     module_config *add = (module_config*)in_add;
 
     module_config *newconfig = apr_palloc(pool, sizeof(module_config));
+    newconfig->doctype = add->doctype ? add->doctype : base->doctype;
+    newconfig->docmode = add->docmode ? add->docmode : base->docmode;
 
     return newconfig;
 }
@@ -76,11 +137,37 @@ static void *init_context(ap_filter_t *f) {
 
         module_config *config = ap_get_module_config(f->r->per_dir_config, &clover_module);
 
-        context->passbb = apr_brigade_create(f->r->pool, f->c->bucket_alloc);
         apr_pool_create(&context->subpool, f->r->pool);
+
+        context->passbb = apr_brigade_create(f->r->pool, f->c->bucket_alloc);
+        context->snippets = apr_brigade_create(f->r->pool, f->c->bucket_alloc);
+
+        context->regex_doctype = apr_pcalloc(f->r->pool, sizeof(ap_regex_t));
+        if ( context->regex_doctype &&
+             ap_regcomp(context->regex_doctype, "^<\\!DOCTYPE html", AP_REG_ICASE)!=0 ) {
+            context->regex_doctype = NULL;
+            logging(context, f->r, "ap_regcomp for doctype failed.");
+        }
+
+        context->regex_docmode = apr_pcalloc(f->r->pool, sizeof(ap_regex_t));
+        if ( context->regex_docmode &&
+             ap_regcomp(context->regex_docmode, "^\\s*<meta http-equiv=\"x-ua-compatible\"", AP_REG_ICASE)!=0 ) {
+            context->regex_docmode = NULL;
+            logging(context, f->r, "ap_regcomp for docmode failed.");
+        }
+
+        context->doctype = config->doctype ? HTML_DOCTYPES[MIN(atoi(config->doctype), doctype_Sentinel)] : "";
+        context->docmode = config->docmode ? apr_psprintf(f->r->pool, HTML_DOCMODE_TEMPLATE, config->docmode) : "";
+        context->processed_doctype = 0;
+        context->processed_docmode = 0;
     }
 
     return f->ctx;
+}
+
+static int match_line(ap_regex_t *regex, const char *line) {
+    ap_regmatch_t pmatch[10];
+    return regex ? (ap_regexec(regex, line, 10, pmatch, 0)==0) : 0;
 }
 
 static apr_status_t clover_handler(ap_filter_t *f, apr_bucket_brigade *bb) {
@@ -95,7 +182,7 @@ static apr_status_t clover_handler(ap_filter_t *f, apr_bucket_brigade *bb) {
     }
 
     // Workaround: It seems that apr_pvsprintf cannot take a 64bit value
-    logging(context, f->r, "ENTERING clover_handler (ctx=0x%08x%08x)", LLP(context));
+    LOGDEBUG(context, f->r, "ENTERING clover_handler (ctx=0x%08x%08x)", LLP(context));
 
     if ( APR_BRIGADE_EMPTY(bb) ) {
         return APR_SUCCESS;
@@ -105,24 +192,107 @@ static apr_status_t clover_handler(ap_filter_t *f, apr_bucket_brigade *bb) {
           b != APR_BRIGADE_SENTINEL(bb); ) {
         nextbucket = APR_BUCKET_NEXT(b);
 
-        if ( APR_BUCKET_IS_EOS(b) ) {
-        }
-        else if ( APR_BUCKET_IS_METADATA(b) ) {
-        }
-        else if ( APR_BUCKET_IS_FLUSH(b) ) {
+        if ( !APR_BUCKET_IS_EOS(b) && !APR_BUCKET_IS_METADATA(b) && !APR_BUCKET_IS_FLUSH(b) ) {
+            // Processing data bucket...
+            const char *data = NULL;
+            apr_size_t bucketlength = 0;
+
+            status = apr_bucket_read(b, &data, &bucketlength, APR_BLOCK_READ);
+            if ( status!=APR_SUCCESS || bucketlength==0 ) {
+                // If data cannot be retrieved from a bucket, just ignore it.
+            }
+            else {
+                while ( bucketlength>0 ) {
+                    const char *newline = memchr(data, APR_ASCII_LF, bucketlength);
+                    if ( !newline ) {
+                        APR_BUCKET_REMOVE(b);
+                        APR_BRIGADE_INSERT_TAIL(context->snippets, b);
+                        bucketlength = 0;
+                    }
+                    else {
+                        apr_size_t linelength = 0;
+                        char *linestr = NULL;
+                        const char *replaced_line = NULL;
+
+                        apr_size_t len_to_newline = (apr_size_t)(newline-data)+1;
+
+                        if ( len_to_newline<bucketlength ) {
+                            //
+                            // No need to update nextbucket here.
+                            //
+                            // before split: b --> nextbucket
+                            // after split:  b --> newbucket --> nextbucket
+                            // remove b
+                            // assign a value of newbucket to nextbucket
+                            //
+                            apr_bucket *newbucket = NULL;
+
+                            apr_bucket_split(b, len_to_newline);
+                            newbucket = APR_BUCKET_NEXT(b);
+
+                            APR_BUCKET_REMOVE(b);
+                            APR_BRIGADE_INSERT_TAIL(context->snippets, b);
+
+                            b = newbucket;
+
+                            data += len_to_newline;
+                            bucketlength -= len_to_newline;
+                        }
+                        else {
+                            // reaches the end of bucket
+                            APR_BUCKET_REMOVE(b);
+                            APR_BRIGADE_INSERT_TAIL(context->snippets, b);
+                            bucketlength = 0;
+                        }
+
+                        status = apr_brigade_pflatten(context->snippets, &linestr, &linelength, context->subpool);
+                        if ( status!=APR_SUCCESS ) {
+                            logging(context, f->r, "apr_brigade_pflatten failed - %d\n", (int)status);
+                            goto cleanup;
+                        }
+
+                        if ( !context->processed_doctype && match_line(context->regex_doctype, linestr) ) {
+                            replaced_line = context->doctype;
+                            linelength = strlen(replaced_line);
+                        }
+
+                        // If the first line is not DOCTYPE, we don't need to check DOCTYPE anymore.
+                        context->processed_doctype = 1;
+
+                        if ( !context->processed_docmode && match_line(context->regex_docmode, linestr) ) {
+                            replaced_line = context->docmode;
+                            linelength = strlen(replaced_line);
+                            context->processed_docmode = 1;
+                        }
+
+                        APR_BRIGADE_INSERT_TAIL(context->passbb,
+                            apr_bucket_transient_create(
+                                replaced_line ? replaced_line : linestr,
+                                linelength, f->r->connection->bucket_alloc));
+
+                        apr_brigade_cleanup(context->snippets);
+                    }
+                } // sub loop
+            }
         }
         else {
+            // If a bucket is not a data bucket, simply passes it to the next filter.
+            APR_BUCKET_REMOVE(b);
+            APR_BRIGADE_INSERT_TAIL(context->passbb, b);
         }
 
+        if ( !APR_BRIGADE_EMPTY(context->passbb) ) {
+            status = ap_pass_brigade(f->next, context->passbb);
+            apr_brigade_cleanup(context->passbb);
+            apr_pool_clear(context->subpool);
+        }
         b = nextbucket;
     } // main loop
 
-    status = ap_pass_brigade(f->next, bb);
-
 cleanup:
-    apr_pool_clear(context->subpool);
+    LOGDEBUG(context, f->r, "LEAVING clover_handler (ctx=0x%08x%08x)", LLP(context));
 
-    logging(context, f->r, "LEAVING clover_handler (ctx=0x%08x%08x)", LLP(context));
+    apr_pool_clear(context->subpool);
 
     return status;
 }
