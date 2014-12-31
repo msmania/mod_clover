@@ -92,7 +92,7 @@ static const command_rec commands_table[] = {
                   "Document mode for IE"),
     AP_INIT_TAKE1("Clover_Dynamic", ap_set_int_slot,
                   (void*)APR_OFFSETOF(module_config, dynamic), OR_ALL,
-                  "Control via a query string if the value is non-zernon-zero"),
+                  "Control via a query string if the value is non-zero"),
     {NULL}
 };
 
@@ -187,13 +187,19 @@ static void *init_context(ap_filter_t *f) {
 
         if ( effective.doctype ) {
             int doctype_num = atoi(effective.doctype);
-            context->doctype = doctype_num < doctype_Sentinel ? HTML_DOCTYPES[doctype_num] : "";
+            context->doctype = (doctype_num>=0 && doctype_num<doctype_Sentinel) ? HTML_DOCTYPES[doctype_num] : "";
         }
         else {
             context->doctype = NULL;
         }
 
-        context->docmode = effective.docmode ? apr_psprintf(f->r->pool, HTML_DOCMODE_TEMPLATE, effective.docmode) : NULL;
+        if ( effective.docmode ) {
+            context->docmode = effective.docmode[0] ? apr_psprintf(f->r->pool, HTML_DOCMODE_TEMPLATE, effective.docmode) : "";
+        }
+        else {
+            context->docmode = NULL;
+        }
+
         context->processed_doctype = 0;
         context->processed_docmode = 0;
 
@@ -207,8 +213,8 @@ static void *init_context(ap_filter_t *f) {
 }
 
 static int match_line(ap_regex_t *regex, const char *line) {
-    ap_regmatch_t pmatch[10];
-    return regex ? (ap_regexec(regex, line, 10, pmatch, 0)==0) : 0;
+    ap_regmatch_t pmatch[1];
+    return regex ? (ap_regexec(regex, line, 1, pmatch, 0)==0) : 0;
 }
 
 static apr_status_t clover_handler(ap_filter_t *f, apr_bucket_brigade *bb) {
