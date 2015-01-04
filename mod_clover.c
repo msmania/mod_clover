@@ -15,7 +15,15 @@
 #define HIDWORD(ll) ((((long long)(ll))>>32)&0xffffffff)
 #define LLP(p) HIDWORD(p), LODWORD(p)
 
+#ifdef DEBUG
+#define DEBUGBREAK() raise(SIGTRAP)
+#define LOGDEBUG logging
+#define DUMPBB dump_bucket_brigade
+#else
+#define DEBUGBREAK()
 #define LOGDEBUG
+#define DUMPBB
+#endif
 
 static const char FILTER_NAME[]="CLOVER";
 
@@ -75,6 +83,8 @@ typedef struct {
     const char *docmode;
     int processed_doctype;
     int processed_docmode;
+
+    int counter_fordebug;
 } filter_context;
 
 typedef struct {
@@ -207,6 +217,8 @@ static void *init_context(ap_filter_t *f) {
         LOGDEBUG(context, f->r, "effective.docmode = %s", effective.docmode);
         LOGDEBUG(context, f->r, "context->doctype = %s", context->doctype);
         LOGDEBUG(context, f->r, "context->docmode = %s", context->docmode);
+
+        context->counter_fordebug = 0;
     }
 
     return f->ctx;
@@ -215,6 +227,17 @@ static void *init_context(ap_filter_t *f) {
 static int match_line(ap_regex_t *regex, const char *line) {
     ap_regmatch_t pmatch[1];
     return regex ? (ap_regexec(regex, line, 1, pmatch, 0)==0) : 0;
+}
+
+static void dump_bucket_brigade(filter_context *context, request_rec *req, apr_bucket_brigade *bb) {
+    apr_bucket *first = APR_BRIGADE_FIRST(bb);
+    apr_bucket *b = first;
+    int cnt = 0;
+    LOGDEBUG(context, req, "bb = 0x%08x%08x", LLP(bb));
+    do {
+        LOGDEBUG(context, req, "[%d] 0x%08x%08x", cnt++, LLP(b));
+        b = APR_BUCKET_NEXT(b);
+    } while ( b!=first );
 }
 
 static apr_status_t clover_handler(ap_filter_t *f, apr_bucket_brigade *bb) {
@@ -239,21 +262,55 @@ static apr_status_t clover_handler(ap_filter_t *f, apr_bucket_brigade *bb) {
           b != APR_BRIGADE_SENTINEL(bb); ) {
         nextbucket = APR_BUCKET_NEXT(b);
 
-        if ( !APR_BUCKET_IS_EOS(b) && !APR_BUCKET_IS_METADATA(b) && !APR_BUCKET_IS_FLUSH(b) ) {
+        if ( APR_BUCKET_IS_EOS(b) ) {
+            APR_BRIGADE_CONCAT(context->passbb, context->snippets);
+            APR_BUCKET_REMOVE(b);
+            APR_BRIGADE_INSERT_TAIL(context->passbb, b);
+        }
+        else if ( APR_BUCKET_IS_METADATA(b) || APR_BUCKET_IS_FLUSH(b) ) {
+            // If a bucket is not a data bucket, simply passes it to the downstream filter.
+            APR_BUCKET_REMOVE(b);
+            APR_BRIGADE_INSERT_TAIL(context->passbb, b);
+        }
+        else {
             // Processing data bucket...
             const char *data = NULL;
             apr_size_t bucketlength = 0;
 
             status = apr_bucket_read(b, &data, &bucketlength, APR_BLOCK_READ);
+
+            LOGDEBUG(context, f->r, "0x%08x%08x-0x%08x%08x\n", LLP(data), LLP(data+bucketlength));
+            DEBUGBREAK();
+
             if ( status!=APR_SUCCESS || bucketlength==0 ) {
                 // If data cannot be retrieved from a bucket, just ignore it.
             }
             else {
                 while ( bucketlength>0 ) {
                     const char *newline = memchr(data, APR_ASCII_LF, bucketlength);
+
+                    LOGDEBUG(context, f->r, "counter=%d d=0x%08x%08x l=%d nl=0x%08x%08x\n",
+                        context->counter_fordebug++,
+                        LLP(data),
+                        bucketlength,
+                        LLP(newline));
+
                     if ( !newline ) {
                         APR_BUCKET_REMOVE(b);
-                        APR_BRIGADE_INSERT_TAIL(context->snippets, b);
+
+                        // When a string does not have LF, it's likely that context->snippets
+                        // is not processed in 'this' function call and a buffer in the bucket
+                        // can be invalid in the next call. Thus we need to create a new buffer
+                        // and a new bucket.
+                        // When a string has LF, on the other hand, we can use the same bucket
+                        // because context->snippets is surely processeed in this function.
+                        APR_BRIGADE_INSERT_TAIL(context->snippets,
+                            apr_bucket_pool_create(
+                                apr_pmemdup(f->r->pool, data, bucketlength),
+                                bucketlength,
+                                f->r->pool,
+                                f->r->connection->bucket_alloc));
+
                         bucketlength = 0;
                     }
                     else {
@@ -287,6 +344,9 @@ static apr_status_t clover_handler(ap_filter_t *f, apr_bucket_brigade *bb) {
                         }
                         else {
                             // reaches the end of bucket
+                            DUMPBB(context, f->r, context->snippets);
+                            DEBUGBREAK();
+
                             APR_BUCKET_REMOVE(b);
                             APR_BRIGADE_INSERT_TAIL(context->snippets, b);
                             bucketlength = 0;
@@ -321,11 +381,6 @@ static apr_status_t clover_handler(ap_filter_t *f, apr_bucket_brigade *bb) {
                     }
                 } // sub loop
             }
-        }
-        else {
-            // If a bucket is not a data bucket, simply passes it to the next filter.
-            APR_BUCKET_REMOVE(b);
-            APR_BRIGADE_INSERT_TAIL(context->passbb, b);
         }
 
         if ( !APR_BRIGADE_EMPTY(context->passbb) ) {
